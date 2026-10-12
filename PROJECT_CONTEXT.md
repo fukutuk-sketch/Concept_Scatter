@@ -3,7 +3,7 @@
 Blender 用アドオン「スキャッター（Concept Scatter）」の開発メモです。Claude Code のクラウドセッションで続きを開発するときは、まずこのファイルを読んでください。
 
 - 作者：小坂正明（コンセプトアーティスト。日本語でやりとり。プログラマーではない）
-- 最終更新：2026-10-12
+- 最終更新：2026-10-12（v0.3 を実装。実機未テスト）
 - 対象：Blender 4.5.4 LTS（EEVEE Next）、Windows PC「asaki722」（RTX 3060 / 32GB）
 
 ---
@@ -25,15 +25,12 @@ UI は 3D ビューのサイドバーにある「Concept」タブの「スキャ
 ## 2. ファイル構成
 
 ```
-concept-scatter/
+Concept_Scatter/                    （GitHub: fukutuk-sketch/Concept_Scatter）
 ├── concept_scatter.py          アドオン本体（1 ファイル。Blender の addons フォルダにそのまま置く）
+├── concept_ground_paint.py     地面ペイント（別アドオン）の参照用コピー。ここでは編集しない
 ├── PROJECT_CONTEXT.md          このファイル
 ├── CLAUDE.md                   Claude Code 向けの作業ルール（短い）
-├── README.md                   概要とインストール方法
-├── .gitignore
-├── docs/images/                スクリーンショット
-└── reference/
-    └── concept_ground_paint.py 地面ペイント（別アドオン）の参照用コピー。ここでは編集しない
+└── tests/mock_check.py         Blender なしで動くチェック（スタブ bpy。下の「7」を参照）
 ```
 
 ブランチ：
@@ -41,7 +38,9 @@ concept-scatter/
 | ブランチ | 中身 | 状態 |
 |---|---|---|
 | `main` | v0.2.0 | ユーザーの Blender で動作確認済み・常に有効化済み |
-| `feature/foliage-brush` | v0.3.0（UE 風「ブラシで生やす」） | **未テスト・未導入**。次の作業で検証する |
+| `claude/peaceful-mayer-oh5s4i` | v0.3.0（UE 風「ブラシで生やす」） | **コード実装済み・Blender 未テスト・未導入**。次の作業で実機検証する |
+
+（以前のメモにあった `feature/foliage-brush` はリモートに存在しなかったため、v0.2 を土台に v0.3 を書き起こしました。）
 
 ユーザー PC での置き場所：`C:\Users\bator\AppData\Roaming\Blender Foundation\Blender\4.5\scripts\addons\concept_scatter.py`
 
@@ -82,18 +81,21 @@ concept-scatter/
 - 地面ペイント側の変更（レイヤーの並び替え・不透明度・ノイズの細かさ）を depsgraph ハンドラで検知し、自動で追従します。
 - 保存前にブラシ画像を pack します。
 
-### v0.3.0（feature/foliage-brush・未テスト）
+### v0.3.0（`claude/peaceful-mayer-oh5s4i`・Blender 未テスト）
 
-- **「ブラシで生やす」**（`csc.foliage_paint`、モーダルオペレーター）：オブジェクトモードのまま地面をなでると、その場に生えます。
-  - 操作：左ドラッグで生やす、Shift/Ctrl+ドラッグで消す、`[` `]` でサイズ、Shift+`[` `]` で強さ、Ctrl+ホイールでもサイズ、Ctrl+Z でストローク単位の取り消し（モーダル中のみ）、Enter／右クリック／Esc で終了。中ボタンやテンキーの視点操作は素通しします。
-  - 地面の上に円形カーソルを GPU で描画します（緑＝生やす、赤＝消す、内側の円がやわらかさ）。
-  - 地面へのレイキャストは、評価済みメッシュのローカル座標から真上投影 UV を自前で計算します。ブラシ画像は numpy 配列として保持し、約 60ms ごとに `foreach_set` ＋ `update_tag()` で書き込みます。
-  - ブラシ中はパネル操作ができ、押したときにアクティブなレイヤーへ自動で切り替えます。
-- ブラシ画像の形式を変更：**R＝生やす、G＝消す**（`csc_fmt = 2`）。v0.2 の画像は R だけ残して自動変換します。
-  - 最終範囲 ＝ max(地面ペイントの範囲, 生やす) × (1 − 消す)。ふちのノイズはジオメトリノード側で付けます。
-- 塗った所の表示：ブラシ中（または「塗った所を色で表示」ON のとき）は、ビューポートだけ半透明の緑／赤のオーバーレイを地面に重ねます（マテリアル `CSC_BrushPreview`）。
-- テクスチャペイント方式の密度ブラシ（`csc.brush_paint` / `csc.brush_exit`）は削除しました。
-- 「ブラシで生やす」パネル（`CSC_PT_brush`）を追加しました。
+- **「ブラシで生やす」**（`csc.foliage_paint`、モーダルオペレーター）：オブジェクトモードのまま地面をなでると、その場に生えます。パネル `CSC_PT_brush` のボタンで開始し、ブラシ中は「ブラシを終了」ボタン（`csc.foliage_exit`）に変わります。
+  - 操作：左ドラッグで生やす、Shift/Ctrl+ドラッグで消す、`[` `]` でサイズ、Shift+`[` `]` で強さ、Ctrl+ホイールでもサイズ、Ctrl+Z でストローク単位の取り消し（モーダル中のみ・最大 40 回）、Enter／右クリック／Esc で終了（Esc はサイドバー上でも効く）。
+  - 素通しするもの：中ボタン・テンキー・Alt+左クリック・サイドバー／ヘッダー上のイベント・ビューポート右上のナビゲーションギズモ付近（右 130px × 上 210px の左クリックのみ）。
+  - 地面の上に円形カーソルを GPU で描画します（緑＝生やす、赤＝消す、内側の円がやわらかさ）。円は真上投影の輪郭を地形に沿わせて描くので、斜面では塗られる形と一致します。
+  - 地面へのレイキャストは `Object.ray_cast`（評価済みメッシュ）。ヒット位置のローカル XY を、地面ペイントの UV と同じ式（ベースメッシュの XY バウンディングボックス）で UV にします。ブラシ画像は numpy 配列として保持し、約 60ms ごとに `foreach_set` ＋ `update_tag()` で全面書き込みします（`FP_FLUSH`）。
+  - 点は楕円（UV の縦横比を補正）で打ち、ストローク中は半径の 0.2 倍間隔で補間します。生やす＝R を max で上げ G を消す、消す＝G を max で上げる。
+  - パネル操作ができ、押したときにアクティブなレイヤーへ自動で切り替えます（そのレイヤーでブラシ未使用なら自動で有効化＝木の作り直し 1 回）。
+- ブラシ画像の形式を変更：**R＝生やす、G＝消す**（`csc_fmt = 2`、`BRUSH_FMT`）。v0.2 の画像はファイル読み込み時とブラシ使用時に自動変換します（`convert_v02_image`：地面ペイントの範囲に「しぼる」で使っていた画像は「塗っていない所＝消す」に変換）。
+  - 最終範囲 ＝ max(地面ペイントの範囲, 生やす) × (1 − 消す)。ふちのノイズは共有ノードグループ `CSC_BrushMask`（Grow / Erase を出力）で、`P_brush_noise` と `P_brush_nscale` の値で付けます。
+  - v0.2 で作ったノードツリーは、読み込み時に `tree["csc_brush_fmt"]` を見て作り直します。
+- 塗った所の表示：ブラシ中（または「塗った所を色で表示」ON のとき）は、**アクティブなレイヤーだけ**、ビューポートだけ半透明の緑／赤のオーバーレイを地面に重ねます。散布オブジェクトのノードツリーに、地面のコピー（法線方向に 1cm 浮かせて `CSC_BrushPreview_<uid>` マテリアルを設定）を `Switch` で足しています（`P_overlay` > 0.5 かつビューポートのときだけ評価）。マテリアルのビューポート表示色は透明にしてあるので、Solid 表示では見えません（Material プレビュー以降で見える）。
+- テクスチャペイント方式の密度ブラシ（`csc.brush_paint` / `csc.brush_exit`）と関連コード（ペイントモード監視タイマーなど）は削除しました。`brush_mode`（しぼる／足す）プロパティは v0.2 画像の変換のためだけに残しています。
+- 地面側の新しい設定：サイズ（`brush_radius`）、強さ、やわらかさ、境界のノイズ、ノイズの細かさ、塗った所を色で表示。
 
 ---
 
@@ -106,10 +108,10 @@ concept-scatter/
 | Placement core | `_GB`（ノード作成ヘルパー）、共有ノードグループ `CSC_PaintMask` / `CSC_RangeMask` / `CSC_CameraCull`（`GROUP_VER` で版管理）、`build_scatter_tree(tree, spec)`、`push_values(tree, values)`、`setup_camera_drivers` |
 | Layer data → spec / values | `layer_spec()`（PropertyGroup → spec 辞書）、`layer_values()`（→ `P_*` の値） |
 | Scatter objects | `ensure_scatter_object`、`rebuild_layer`、`apply_visibility`、`sync_assets`、`ground_area` |
-| Own brush | UV（`CGP_UV` があれば流用、無ければ `CSC_UV` を作成）、ブラシ画像 |
-| Watching | depsgraph ハンドラ（地面ペイントの変化・ペイントモードの検知）、再構築の遅延実行 |
+| Foliage brush data | UV（`CGP_UV` があれば流用、無ければ `CSC_UV` を作成）、ブラシ画像（R＝生やす／G＝消す）、点描画 `paint_dab`・取り消し `Stroke`、v0.2 画像の変換、`CSC_BrushPreview_*` マテリアル、実行中の状態 `_FP` |
+| Watching | depsgraph ハンドラ（地面ペイントの変化・ペイントモードの検知）、再構築の遅延実行、読み込み時の v0.2 データ変換 |
 | Properties | `CSC_Asset`、`CSC_Layer`、`CSC_Ground`（`Object.csc`） |
-| Operators / UI | `csc.*` オペレーター、`CSC_PT_main` と子パネル |
+| Operators / UI | `csc.*` オペレーター（ブラシは `CSC_OT_foliage_paint`）、`CSC_PT_main` と子パネル（`CSC_PT_brush` を含む） |
 | Registration | `register()` は `bpy.data` を触れないので、初期化をタイマーで遅延実行します |
 
 **部品化の方針（重要）：** `build_scatter_tree(tree, spec)` と `push_values()` は UI や PropertyGroup を知らない「配置コア」です。今後作る「隅だまり」などはこの spec を自前で組み立てて再利用する想定です。spec のキーは関数の docstring にまとめてあります。
@@ -139,18 +141,20 @@ concept-scatter/
 
 ### すぐやること（v0.3 の検証）
 
-1. `feature/foliage-brush` の `concept_scatter.py` をユーザーの Blender に入れ、sha256 を確認してから再読み込みする。
-2. モック layout で `CSC_PT_brush` を含む全パネルの `draw()` を確認する（`MOUSE_LMB_DRAG` アイコンの存在も確認）。
+クラウドでできる範囲（`python3 tests/mock_check.py`：全パネルの `draw()`、点描画と Ctrl+Z の数値、v0.2 画像の変換、偽イベントでのモーダルの流れ）は通っています。**以下はユーザーの Blender でしか確認できません。**
+
+1. `claude/peaceful-mayer-oh5s4i` の `concept_scatter.py` をユーザーの Blender に入れ、sha256 を確認してから再読み込みする。まず**コンソール（Window > Toggle System Console）にエラーが出ないか**を見る。
+2. ノードの作成が通るか（ブラシを初めて使ったとき／既存の v0.2 ファイルを開いたとき）。特に `CSC_BrushMask` グループ、オーバーレイの `Switch` / `Set Material`、マテリアル `CSC_BrushPreview_*`（`ShaderNodeMix` の RGBA ソケット）。
 3. 「ブラシで生やす」を実際に使ってもらい、次を確認する。
-   - カーソル円の表示
-   - ドラッグ中から生えるか
-   - 消す操作
-   - Ctrl+Z
-   - 視点操作の素通し
-   - サイドバー上でのクリックの素通し
-   - 緑／赤オーバーレイの見え方（Material プレビューと Solid の両方）
-4. 1024² 画像で `foreach_set` を 60ms ごとに実行して重くないか、を見る。重ければ書き込み範囲を部分更新にする、または間隔を伸ばす。
-5. 問題がなければ main にマージし、ユーザーに常時有効版として入れ直す。
+   - カーソル円の表示（`POLYLINE_UNIFORM_COLOR`。出なければコンソールに `CSC: cursor draw failed` が出る）
+   - ドラッグ中から生えるか／ストロークの途切れ（補間間隔）
+   - 消す操作（Shift / Ctrl）と、生やし直したとき消した跡が戻るか
+   - Ctrl+Z、視点操作（中ボタン・テンキー・ホイール）の素通し、サイドバー上のクリックの素通し、ギズモ付近のクリック
+   - 緑／赤オーバーレイの見え方（Material プレビュー。Solid では見えない仕様）
+   - 傾斜や凸凹のある地面でカーソルの形と、塗られた形が一致するか（UV の投影式の確認）
+4. 1024²／2048² 画像で `foreach_set` を 60ms ごとに実行して重くないか、を見る。重ければ書き込み範囲を部分更新にする、または `FP_FLUSH` を伸ばす。
+5. v0.2 の保存ファイルを開き、ブラシ画像が変換されて見た目が変わらないか。
+6. 問題がなければ main にマージし、ユーザーに常時有効版として入れ直す。
 
 ### 未確認・既知の注意点
 
@@ -199,3 +203,5 @@ concept-scatter/
 
 - 構文チェック：`python3 -m py_compile concept_scatter.py`
 - PyPI の `bpy` は環境によって取得できない（2026-10 時点のクラウドでは 403）。そのため実際の動作確認は、ユーザーの Blender につないで行う必要があります。
+- 代わりに `python3 tests/mock_check.py`（numpy と mathutils が必要：`pip install numpy mathutils`）。スタブの `bpy` で、全パネルの `draw()` が存在しないプロパティ・演算子・アイコン・演算子の引数を使っていないか、ブラシの数値計算と取り消し、v0.2 画像の変換、モーダルオペレーターの流れ（偽のイベントと平らな地面）を確認します。**ノードツリー・GPU 描画・本物のイベントの扱いは確認できません。**
+- 新しいアイコン名を使うときは `tests/mock_check.py` の `KNOWN_ICONS` にも足す（Blender で存在を確認してから）。

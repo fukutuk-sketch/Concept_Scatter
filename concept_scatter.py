@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Concept Scatter",
     "author": "Claude",
-    "version": (0, 2, 0),
+    "version": (0, 3, 0),
     "blender": (4, 2, 0),
     "location": "3D View > Sidebar > Concept > スキャッター",
     "description": "UEのフォリッジのように、塗った所にアセットを散らす（地面ペイントのレイヤーを範囲に使える）",
@@ -9,10 +9,15 @@ bl_info = {
 }
 
 import bpy
+import gpu
 import math
+import time
 import uuid
+import traceback
 import mathutils
 import numpy as np
+from gpu_extras.batch import batch_for_shader
+from bpy_extras import view3d_utils
 from bpy.props import (StringProperty, FloatProperty, IntProperty, BoolProperty,
                        EnumProperty, PointerProperty, CollectionProperty)
 from bpy.app.handlers import persistent
@@ -23,6 +28,7 @@ CGP_UV = "CGP_UV"
 GROUP_VER = 1
 INTERNAL = "csc_internal"      # custom prop on our own collections / objects
 ID_ATTR = "csc_id"             # stable per-point id stored right after distributing
+BRUSH_FMT = 2                  # brush image format: R = grow, G = erase (v0.2 images: R = weight, G, B = softness / noise)
 MAX_ASSETS = 32
 DEFAULT_NAME = "スキャッター"
 
@@ -211,6 +217,32 @@ def ensure_paint_mask():
     return g
 
 
+def ensure_brush_mask():
+    """Decodes the foliage brush image. R = grow, G = erase (both 0..1).
+    The edge noise only moves the in-between values: 0 stays 0 and 1 stays 1."""
+    g, fresh = _new_group("CSC_BrushMask")
+    if not fresh:
+        return g
+    b, I, O = _group_io(g, [("UV", 'NodeSocketVector', None), ("Image", 'NodeSocketImage', None),
+                            ("Noise", 'NodeSocketFloat', 0.5), ("Amount", 'NodeSocketFloat', 0.5)],
+                        [("Grow", 'NodeSocketFloat'), ("Erase", 'NodeSocketFloat')])
+    tex = b.node("GeometryNodeImageTexture", hide=False, interpolation='Linear', extension='EXTEND')
+    b.link(I["Image"], _sock(tex.inputs, "Image"))
+    b.link(I["UV"], _sock(tex.inputs, "Vector"))
+    sp = b.node("FunctionNodeSeparateColor")
+    b.link(_sock(tex.outputs, "Color"), sp.inputs[0])
+    b.col()
+    nz = b.math('MULTIPLY', b.math('SUBTRACT', I["Noise"], 0.5), b.math('MULTIPLY', I["Amount"], 2.0))
+
+    def edge(w):
+        env = b.math('MULTIPLY', b.math('MULTIPLY', w, b.math('SUBTRACT', 1.0, w)), 4.0)
+        return b.math('ADD', w, b.math('MULTIPLY', nz, env), clamp=True)
+
+    b.link(edge(sp.outputs[0]), O["Grow"])
+    b.link(edge(sp.outputs[1]), O["Erase"])
+    return g
+
+
 def ensure_range_mask():
     """1 inside [Min, Max], fading to 0 over Soft outside the range."""
     g, fresh = _new_group("CSC_RangeMask")
@@ -260,8 +292,11 @@ def ensure_camera_cull():
     return g
 
 
+GROUP_NAMES = ("CSC_PaintMask", "CSC_BrushMask", "CSC_RangeMask", "CSC_CameraCull")
+
+
 def ensure_groups():
-    return ensure_paint_mask(), ensure_range_mask(), ensure_camera_cull()
+    return ensure_paint_mask(), ensure_brush_mask(), ensure_range_mask(), ensure_camera_cull()
 
 
 # names of the value nodes that push_values() writes
@@ -269,7 +304,7 @@ VALUE_NODES = ("P_density", "P_min_dist", "P_scale_min", "P_scale_max", "P_spin"
                "P_sink", "P_slope_min", "P_slope_max", "P_slope_soft", "P_h_min", "P_h_max", "P_h_soft",
                "P_noise_inv", "P_noise_t", "P_cull_margin", "P_cull_pad", "P_cull_dist", "P_cam_tx",
                "P_cam_ty", "P_vp", "P_paint_vp", "P_max", "P_cgp_nscale", "P_brush_nscale",
-               "P_avoid_dist", "P_avoid_soft", "P_avoid_l_dist", "P_bbox_dist")
+               "P_avoid_dist", "P_avoid_soft", "P_avoid_l_dist", "P_bbox_dist", "P_brush_noise", "P_overlay")
 
 
 def build_scatter_tree(tree, spec):
@@ -280,18 +315,23 @@ def build_scatter_tree(tree, spec):
       "paint":   None | {"uv": uv map name, "target": None (= whole surface) | (Image|None, index),
                          "cover": [(Image, index), ...]  layers painted above that hide the target,
                          "invert": bool},
-      "brush":   None | {"uv": uv map name, "image": Image, "mode": 'MUL' | 'ADD'}  own density paint,
+      "brush":   None | {"uv": uv map name, "image": Image}  foliage brush (R = grow, G = erase):
+                 area = max(paint area, grow) * (1 - erase),
+      "overlay": None | {"uv": uv map name, "image": Image, "material": Material}  viewport-only tint of
+                 the brush image on the surface (shown while P_overlay > 0.5),
       "avoid":   None | Collection   keep away from these objects (P_avoid_dist / P_avoid_soft),
       "avoid_points": [Object, ...]  keep away from the instances of these scatter objects (P_avoid_l_dist),
       "slope", "height", "noise", "cull", "bbox": bool
     }
     All numbers live in named Value nodes (see VALUE_NODES, P_seed, P_pick_<k>, P_cgp_op_<i>)."""
-    pm, rm, cc = ensure_groups()
+    pm, bm, rm, cc = ensure_groups()
     ad = tree.animation_data
     if ad is not None:
         for fc in list(ad.drivers):
             ad.drivers.remove(fc)
     tree.nodes.clear()
+    if "csc_brush_fmt" in tree:
+        del tree["csc_brush_fmt"]
     tree.interface.clear()
     tree.interface.new_socket(name="Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
     tree.interface.new_socket(name="Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
@@ -388,19 +428,22 @@ def build_scatter_tree(tree, spec):
         area = m
 
     brush = spec.get("brush")
-    if brush:
+    if brush and brush.get("image") is not None:
         nzb = b.node("ShaderNodeTexNoise", noise_dimensions='3D')
         b.link(b.vmath('ADD', local_pos(), (17.13, 3.71, 9.27)), _sock(nzb.inputs, "Vector"))
         b.link(P["P_brush_nscale"], _sock(nzb.inputs, "Scale"))
         _sock(nzb.inputs, "Detail").default_value = 2.0
-        bm = painted(brush.get("image"), uv_attr(brush.get("uv", CGP_UV)), 1.0, _sock(nzb.outputs, "Fac"),
-                     "brush")
-        if area is None:
-            area = bm
-        elif brush.get("mode") == 'ADD':
-            area = b.math('MAXIMUM', area, bm)
+        gn = b.group(bm, "brush")
+        b.link(uv_attr(brush.get("uv", CGP_UV)), gn.inputs["UV"])
+        gn.inputs["Image"].default_value = brush["image"]
+        b.link(_sock(nzb.outputs, "Fac"), gn.inputs["Noise"])
+        b.link(P["P_brush_noise"], gn.inputs["Amount"])
+        if area is not None:
+            area = b.math('MAXIMUM', area, gn.outputs["Grow"])
         else:
-            area = b.math('MULTIPLY', area, bm)
+            area = gn.outputs["Grow"]
+        area = b.math('MULTIPLY', area, b.math('SUBTRACT', 1.0, gn.outputs["Erase"]))
+        tree["csc_brush_fmt"] = BRUSH_FMT
     if area is not None:
         mul(area)
 
@@ -594,6 +637,22 @@ def build_scatter_tree(tree, spec):
             near = b.boolean('NOT', far)
             place(geo, near if sel is None else b.boolean('AND', sel, near))
             place(box, far if sel is None else b.boolean('AND', sel, far))
+    ov = spec.get("overlay")
+    if ov and ov.get("image") is not None and ov.get("material") is not None:
+        # viewport only: a copy of the surface, nudged along its normals, tinted by the brush image
+        b.col()
+        show = b.boolean('AND', isvp, b.compare('FLOAT', 'GREATER_THAN', P["P_overlay"], 0.5))
+        sw = b.node("GeometryNodeSwitch", "overlay_switch", input_type='GEOMETRY')
+        b.link(show, _sock(sw.inputs, "Switch"))
+        nrm = b.node("GeometryNodeInputNormal").outputs[0]
+        osp = b.node("GeometryNodeSetPosition", "overlay_lift")
+        b.link(_sock(si.outputs, "Geometry"), _sock(osp.inputs, "Geometry"))
+        b.link(b.vmath('SCALE', nrm, scale=0.01), _sock(osp.inputs, "Offset"))
+        sm = b.node("GeometryNodeSetMaterial", "overlay_material")
+        b.link(_sock(osp.outputs, "Geometry"), _sock(sm.inputs, "Geometry"))
+        _sock(sm.inputs, "Material").default_value = ov["material"]
+        b.link(_sock(sm.outputs, "Geometry"), _sock(sw.inputs, "True", 'GEOMETRY'))
+        b.link(_sock(sw.outputs, "Output", 'GEOMETRY'), join.inputs[0])
     b.col()
     go = b.node("NodeGroupOutput", hide=False)
     b.link(join.outputs[0], go.inputs[0])
@@ -705,10 +764,11 @@ def layer_spec(ground, layer):
                     cover.append((l.image, j))
         paint = {"uv": CGP_UV, "target": None if idx == 0 else (cgp.layers[idx].image, idx),
                  "cover": cover, "invert": layer.paint_invert}
-    brush = None
+    brush = overlay = None
     if layer.use_brush and layer.brush_image is not None and layer.brush_uv:
-        brush = {"uv": layer.brush_uv, "image": layer.brush_image,
-                 "mode": layer.brush_mode if paint is not None else 'MUL'}
+        brush = {"uv": layer.brush_uv, "image": layer.brush_image}
+        overlay = {"uv": layer.brush_uv, "image": layer.brush_image,
+                   "material": ensure_preview_material(layer, layer.brush_image, layer.brush_uv)}
     avoid = None
     if layer.use_avoid and layer.avoid_collection is not None and not _bad_collection(ground, layer.avoid_collection):
         avoid = layer.avoid_collection
@@ -724,6 +784,7 @@ def layer_spec(ground, layer):
         "assets": [a.obj if a.obj is not None else a.coll for a in layer.assets],
         "paint": paint,
         "brush": brush,
+        "overlay": overlay,
         "avoid": avoid,
         "avoid_points": avoid_points,
         "slope": layer.use_slope,
@@ -742,6 +803,14 @@ def _bad_collection(ground, coll):
         if o == ground or o.get(INTERNAL):
             return True
     return False
+
+
+def _overlay_on(ground, layer):
+    """Tint the active layer's brush image on the ground (always while the foliage brush is running)."""
+    s = ground.csc
+    if not (0 <= s.active_index < len(s.layers)) or s.layers[s.active_index].as_pointer() != layer.as_pointer():
+        return False
+    return s.show_overlay or _FP.get("ground") == ground.name
 
 
 def layer_values(ground, layer):
@@ -771,6 +840,8 @@ def layer_values(ground, layer):
         "P_paint_vp": s.paint_pct if (s.paint_reduce and _painting(ground)) else 1.0,
         "P_max": layer.max_count,
         "P_brush_nscale": s.brush_noise_scale,
+        "P_brush_noise": s.brush_noise,
+        "P_overlay": 1.0 if _overlay_on(ground, layer) else 0.0,
         "P_avoid_dist": layer.avoid_distance,
         "P_avoid_soft": layer.avoid_soft,
         "P_avoid_l_dist": layer.avoid_layers_distance,
@@ -978,8 +1049,8 @@ def ground_area(ground):
 
 
 # ====================================================================================
-#  Own density brush (for grounds without Ground Paint, or to add / erase locally)
-#  Same image encoding as Ground Paint: R = weight, G = softness * weight, B = noise * weight
+#  Foliage brush data.  Brush image: R = grow, G = erase (B unused).  Same top-down UV as
+#  Ground Paint, so the image lines up with the ground (CGP_UV when there is one).
 # ====================================================================================
 BRUSH_UV = "CSC_UV"
 
@@ -994,6 +1065,17 @@ def _top_down_uv(me, uv):
     lv = np.empty(len(me.loops), dtype=np.int32)
     me.loops.foreach_get("vertex_index", lv)
     uv.data.foreach_set("uv", ((co[lv, :2] - mn) / size).astype(np.float32).ravel())
+
+
+def ground_uv_bounds(ground):
+    """(min xy, size xy) of the base mesh in the ground's local space: the top-down projection both
+    CGP_UV and CSC_UV were made with."""
+    me = ground.data
+    co = np.empty(len(me.vertices) * 3, dtype=np.float32)
+    me.vertices.foreach_get("co", co)
+    co = co.reshape(-1, 3)
+    mn = co[:, :2].min(0)
+    return mn, np.maximum(co[:, :2].max(0) - mn, 1e-6)
 
 
 def ensure_brush_uv(ground):
@@ -1016,7 +1098,8 @@ def ensure_brush_uv(ground):
     return BRUSH_UV
 
 
-def ensure_brush_image(ground, layer, fill=0.0):
+def ensure_brush_image(ground, layer):
+    """The layer's brush image (made empty when missing, converted when it is a v0.2 image)."""
     img = layer.brush_image
     if img is None:
         res = int(layer.brush_res)
@@ -1027,71 +1110,205 @@ def ensure_brush_image(ground, layer, fill=0.0):
         except TypeError:
             pass
         img["csc_ground"] = ground
+        img["csc_fmt"] = BRUSH_FMT
         layer.brush_image = img
-        fill_image(img, fill, ground.csc)
+        fill_image(img, 0.0)
+    elif img.get("csc_fmt") != BRUSH_FMT:
+        convert_v02_image(img, layer)
     return img
 
 
-def fill_image(img, v, s):
+def read_pixels(img):
     w, h = img.size
-    px = np.empty((w * h, 4), dtype=np.float32)
-    px[:, 0] = v
-    px[:, 1] = v * s.brush_softness
-    px[:, 2] = v * s.brush_noise
-    px[:, 3] = 1.0
-    img.pixels.foreach_set(px.ravel())
-    img.update()
+    px = np.empty(w * h * 4, dtype=np.float32)
+    img.pixels.foreach_get(px)
+    return px.reshape(h, w, 4)
+
+
+def write_pixels(img, buf):
+    img.pixels.foreach_set(np.ascontiguousarray(buf, dtype=np.float32).ravel())
     img.update_tag()     # pixels set from Python do not refresh geometry nodes on their own
-    img.pack()
 
 
-def _apply_brush_colors(ts, s):
-    ups = ts.unified_paint_settings
-    ups.use_unified_color = True
-    fg = (1.0, s.brush_softness, s.brush_noise)
-    bg = (0.0, 0.0, 0.0)
-    flipped = ups.color[0] < 0.5 and ups.secondary_color[0] > 0.5
-    if flipped:
-        ups.color, ups.secondary_color = bg, fg
+def fill_image(img, v):
+    """Everything grown (v = 1) or cleared (v = 0)."""
+    w, h = img.size
+    px = np.zeros((h, w, 4), dtype=np.float32)
+    px[..., 0] = v
+    px[..., 3] = 1.0
+    write_pixels(img, px)
+    img["csc_fmt"] = BRUSH_FMT
+    try:
+        img.pack()
+    except Exception as e:
+        print("CSC: pack failed", img.name, e)
+
+
+def convert_v02_image(img, layer):
+    """v0.2 density images (R = weight, G / B = softness / noise) -> R = grow, G = erase.
+    A v0.2 'restrict' image on top of a Ground Paint range was full where it kept things, so there the
+    old 'not painted' becomes 'erase'."""
+    buf = read_pixels(img)
+    r = buf[..., 0].copy()
+    if layer.cgp_uid and layer.brush_mode == 'MUL':
+        buf[..., 0] = 0.0
+        buf[..., 1] = 1.0 - r
     else:
-        ups.color, ups.secondary_color = fg, bg
+        buf[..., 1] = 0.0
+    buf[..., 2] = 0.0
+    buf[..., 3] = 1.0
+    write_pixels(img, buf)
+    img["csc_fmt"] = BRUSH_FMT
+    try:
+        img.pack()
+    except Exception as e:
+        print("CSC: pack failed", img.name, e)
 
 
-def _painting_brush(context, layer):
-    g = layer.id_data
-    return (g.mode == 'TEXTURE_PAINT' and layer.brush_image is not None and
-            context.scene.tool_settings.image_paint.canvas == layer.brush_image)
+def dab_box(w, h, cx, cy, rx, ry):
+    """(x0, y0, x1, y1) of the pixels a dab at (cx, cy) with radii (rx, ry) can touch, or None."""
+    x0 = max(int(math.floor(cx - rx)), 0)
+    x1 = min(int(math.ceil(cx + rx)) + 1, w)
+    y0 = max(int(math.floor(cy - ry)), 0)
+    y1 = min(int(math.ceil(cy + ry)) + 1, h)
+    if x0 >= x1 or y0 >= y1 or rx <= 0.0 or ry <= 0.0:
+        return None
+    return x0, y0, x1, y1
 
 
-_BRUSH_WATCH = set()
+def paint_dab(buf, cx, cy, rx, ry, softness, strength, erase):
+    """Stamps one soft round dab into buf (h, w, 4) around pixel (cx, cy); rx / ry = radii in pixels.
+    Grow keeps the larger value (R) and wipes erase marks (G) where it lands; erase raises G.
+    Returns (x0, y0, x1, y1) of the touched pixels, or None."""
+    h, w = buf.shape[:2]
+    box = dab_box(w, h, cx, cy, rx, ry)
+    if box is None:
+        return None
+    x0, y0, x1, y1 = box
+    dx = (np.arange(x0, x1, dtype=np.float32) - cx) / rx
+    dy = (np.arange(y0, y1, dtype=np.float32) - cy) / ry
+    d = np.sqrt(dx[None, :] ** 2 + dy[:, None] ** 2)
+    inner = 1.0 - min(max(softness, 0.0), 1.0)
+    t = np.clip((1.0 - d) / max(1.0 - inner, 1e-3), 0.0, 1.0)
+    cover = t * t * (3.0 - 2.0 * t)
+    part = buf[y0:y1, x0:x1]
+    if erase:
+        np.maximum(part[..., 1], cover * strength, out=part[..., 1])
+    else:
+        np.maximum(part[..., 0], cover * strength, out=part[..., 0])
+        part[..., 1] *= 1.0 - cover
+    return x0, y0, x1, y1
 
 
-def _poll_brush():
-    for name in list(_BRUSH_WATCH):
-        g = bpy.data.objects.get(name)
-        if g is None:
-            _BRUSH_WATCH.discard(name)
-            continue
-        if g.mode != 'TEXTURE_PAINT':
-            _end_brush(g)
-    return 0.5 if _BRUSH_WATCH else None
+class Stroke:
+    """Remembers the pixels a stroke touched (the union rectangle, as they were before) for Ctrl+Z."""
+
+    def __init__(self, buf):
+        self.buf = buf
+        self.box = None
+        self.patch = None
+
+    def before(self, box):
+        """Call with the rectangle the next dab will change, before changing it."""
+        if self.box is None:
+            self.box = box
+            x0, y0, x1, y1 = box
+            self.patch = self.buf[y0:y1, x0:x1].copy()
+            return
+        ox0, oy0, ox1, oy1 = self.box
+        nx0, ny0 = min(ox0, box[0]), min(oy0, box[1])
+        nx1, ny1 = max(ox1, box[2]), max(oy1, box[3])
+        if (nx0, ny0, nx1, ny1) == self.box:
+            return
+        patch = self.buf[ny0:ny1, nx0:nx1].copy()      # outside the old box nothing was touched yet
+        patch[oy0 - ny0:oy1 - ny0, ox0 - nx0:ox1 - nx0] = self.patch
+        self.box, self.patch = (nx0, ny0, nx1, ny1), patch
+
+    def result(self):
+        if self.box is None:
+            return None
+        return self.box[0], self.box[1], self.patch
 
 
-def _end_brush(g):
-    prev = g.get("csc_prev_uv")
-    if prev is not None:
-        uv = g.data.uv_layers.get(prev)
-        if uv is not None:
-            g.data.uv_layers.active = uv
-        del g["csc_prev_uv"]
-    for l in g.csc.layers:
-        img = l.brush_image
-        if img is not None and img.is_dirty:
+def restore_patch(buf, entry):
+    x0, y0, patch = entry
+    buf[y0:y0 + patch.shape[0], x0:x0 + patch.shape[1]] = patch
+
+
+def ensure_preview_material(layer, img, uvname):
+    """Translucent green (grow) / red (erase) tint of the brush image, shown on top of the ground."""
+    name = "CSC_BrushPreview_%s" % layer.uid
+    mat = bpy.data.materials.get(name)
+    fresh = mat is None
+    if fresh:
+        mat = bpy.data.materials.new(name)
+        mat.use_nodes = True
+        mat[INTERNAL] = True
+        mat.diffuse_color = (0.0, 0.0, 0.0, 0.0)      # invisible in Solid shading
+        for attr, val in (("surface_render_method", 'BLENDED'), ("use_backface_culling", False)):
             try:
-                img.pack()
-            except Exception as e:
-                print("CSC: pack failed", img.name, e)
-    _BRUSH_WATCH.discard(g.name)
+                setattr(mat, attr, val)
+            except (AttributeError, TypeError):
+                pass
+    nt = mat.node_tree
+    if fresh or nt.nodes.get("brush_tex") is None:
+        nt.nodes.clear()
+        N, L = nt.nodes, nt.links
+        uvn = N.new("ShaderNodeUVMap")
+        uvn.name = "brush_uv"
+        uvn.location = (-900, 0)
+        tex = N.new("ShaderNodeTexImage")
+        tex.name = "brush_tex"
+        tex.interpolation = 'Linear'
+        tex.extension = 'EXTEND'
+        tex.location = (-700, 0)
+        L.new(uvn.outputs[0], tex.inputs["Vector"])
+        sp = N.new("ShaderNodeSeparateColor")
+        sp.location = (-420, 0)
+        L.new(tex.outputs["Color"], sp.inputs[0])
+        al = N.new("ShaderNodeMath")
+        al.operation = 'MAXIMUM'
+        al.location = (-220, -120)
+        L.new(sp.outputs[0], al.inputs[0])
+        L.new(sp.outputs[1], al.inputs[1])
+        al2 = N.new("ShaderNodeMath")
+        al2.operation = 'MULTIPLY'
+        al2.use_clamp = True
+        al2.inputs[1].default_value = 0.55
+        al2.location = (-40, -120)
+        L.new(al.outputs[0], al2.inputs[0])
+        mx = N.new("ShaderNodeMix")
+        mx.data_type = 'RGBA'
+        mx.location = (-220, 120)
+        _sock(mx.inputs, "A", 'RGBA').default_value = (0.15, 0.9, 0.25, 1.0)
+        _sock(mx.inputs, "B", 'RGBA').default_value = (1.0, 0.2, 0.15, 1.0)
+        L.new(sp.outputs[1], _sock(mx.inputs, "Factor", 'VALUE'))
+        em = N.new("ShaderNodeEmission")
+        em.location = (-40, 120)
+        L.new(_sock(mx.outputs, "Result", 'RGBA'), em.inputs["Color"])
+        tr = N.new("ShaderNodeBsdfTransparent")
+        tr.location = (-40, 0)
+        ms = N.new("ShaderNodeMixShader")
+        ms.location = (160, 0)
+        L.new(al2.outputs[0], ms.inputs[0])
+        L.new(tr.outputs[0], ms.inputs[1])
+        L.new(em.outputs[0], ms.inputs[2])
+        out = N.new("ShaderNodeOutputMaterial")
+        out.location = (360, 0)
+        L.new(ms.outputs[0], out.inputs["Surface"])
+    nt.nodes["brush_uv"].uv_map = uvname
+    nt.nodes["brush_tex"].image = img
+    return mat
+
+
+# ====================================================================================
+#  Foliage brush runtime state (also read by the cursor drawing and by layer_values)
+# ====================================================================================
+_FP = {}       # empty while the brush is not running
+
+
+def foliage_running():
+    return bool(_FP.get("ground"))
 
 
 # ====================================================================================
@@ -1173,20 +1390,50 @@ def _csc_depsgraph_post(scene, depsgraph):
         _STATE[name] = (st, va, painting)
 
 
+def _fp_reset():
+    """Drops the foliage brush state (the cursor drawing included)."""
+    h = _FP.get("handle")
+    if h is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(h, 'WINDOW')
+        except Exception:
+            pass
+    _FP.clear()
+
+
+def _migrate_all():
+    """Brings data saved by older versions up to date (v0.2 brush images / trees, left-over paint-mode state)."""
+    for o in bpy.data.objects:
+        if o.type != 'MESH' or len(o.csc.layers) == 0:
+            continue
+        prev = o.get("csc_prev_uv")
+        if prev is not None:
+            uv = o.data.uv_layers.get(prev)
+            if uv is not None:
+                o.data.uv_layers.active = uv
+            del o["csc_prev_uv"]
+        for l in o.csc.layers:
+            try:
+                img = l.brush_image
+                if img is not None and img.get("csc_fmt") != BRUSH_FMT:
+                    convert_v02_image(img, l)
+                if l.use_brush and img is not None:
+                    t = _tree(l)
+                    if t is not None and t.get("csc_brush_fmt") != BRUSH_FMT:
+                        rebuild_layer(o, l)
+            except Exception as e:
+                print("CSC: migration failed", o.name, l.name, e)
+
+
 @persistent
 def _csc_load_post(*args):
     _STATE.clear()
     _scan()
-    _BRUSH_WATCH.clear()
-    for o in bpy.data.objects:
-        if o.get("csc_prev_uv") is not None:
-            _BRUSH_WATCH.add(o.name)
-    if _BRUSH_WATCH and not bpy.app.timers.is_registered(_poll_brush):
-        bpy.app.timers.register(_poll_brush, first_interval=1.0)
+    _fp_reset()
     # bring shared node groups up to date in files saved by older versions
-    if any(g.name in ("CSC_PaintMask", "CSC_RangeMask", "CSC_CameraCull") and g.get("csc_ver") != GROUP_VER
-           for g in bpy.data.node_groups):
+    if any(g.name in GROUP_NAMES and g.get("csc_ver") != GROUP_VER for g in bpy.data.node_groups):
         ensure_groups()
+    _migrate_all()
 
 
 # ====================================================================================
@@ -1261,8 +1508,7 @@ def _upd_use_brush(self, context):
             layer.brush_uv = ensure_brush_uv(ground)
         except RuntimeError as e:
             print("CSC:", e)
-        # with a Ground Paint range the brush starts fully painted, so painting with X erases locally
-        ensure_brush_image(ground, layer, fill=1.0 if (layer.cgp_uid and layer.brush_mode == 'MUL') else 0.0)
+        ensure_brush_image(ground, layer)
     rebuild_layer(ground, layer, context.scene)
 
 
@@ -1271,13 +1517,14 @@ def _upd_brush_res(self, context):
     res = int(self.brush_res)
     if img is not None and tuple(img.size) != (res, res):
         img.scale(res, res)
-        img.pack()
-
-
-def _upd_brush_colors(self, context):
-    g = self.id_data
-    if g.mode == 'TEXTURE_PAINT' and any(_painting_brush(context, l) for l in self.layers):
-        _apply_brush_colors(context.scene.tool_settings, self)
+        img["csc_fmt"] = BRUSH_FMT
+        img.update_tag()
+        try:
+            img.pack()
+        except Exception as e:
+            print("CSC: pack failed", img.name, e)
+        if foliage_running():
+            _FP["reload"] = True
 
 
 def _coll_poll(self, c):
@@ -1389,14 +1636,13 @@ class CSC_Layer(bpy.types.PropertyGroup):
                               description="まだら模様1つぶんのおおよその大きさ")
     noise_keep: FloatProperty(name="残す割合", default=0.5, min=0.0, max=1.0, subtype='FACTOR',
                               update=_upd_values, description="まだらのうち、生やす部分の割合")
-    # own density brush
-    use_brush: BoolProperty(name="専用の密度ブラシ", default=False, update=_upd_use_brush,
-                            description="このレイヤー専用の密度を、地面に直接塗って決める（地面ペイントを使っていない地面でも使える）")
+    # foliage brush
+    use_brush: BoolProperty(name="ブラシで生やした分を使う", default=False, update=_upd_use_brush,
+                            description="ブラシで生やした所・消した所を、このレイヤーの範囲に反映する（ブラシを使うと自動でONになる）")
     brush_image: PointerProperty(type=bpy.types.Image)
     brush_uv: StringProperty(default="")
-    brush_mode: EnumProperty(name="組み合わせ", default='MUL', update=_upd_struct, items=[
-        ('MUL', "しぼる", "地面ペイントの範囲のうち、ブラシで塗った所だけに生やす（最初は全面塗り。X で消す）"),
-        ('ADD', "足す", "地面ペイントの範囲に、ブラシで塗った所を追加する")])
+    brush_mode: EnumProperty(name="（v0.2の組み合わせ）", default='MUL', items=[       # only used to convert v0.2 images
+        ('MUL', "しぼる", ""), ('ADD', "足す", "")])
     brush_res: EnumProperty(name="解像度", default='1024', update=_upd_brush_res, items=[
         ('512', "512", ""), ('1024', "1024", ""), ('2048', "2048", "")])
     # keep away from other things
@@ -1433,21 +1679,26 @@ class CSC_Layer(bpy.types.PropertyGroup):
 
 class CSC_Ground(bpy.types.PropertyGroup):
     layers: CollectionProperty(type=CSC_Layer)
-    active_index: IntProperty(default=0)
+    active_index: IntProperty(default=0, update=_upd_ground_values)
     solo_uid: StringProperty(default="")
     collection: PointerProperty(type=bpy.types.Collection)
     paint_reduce: BoolProperty(name="塗っている間は減らす", default=True, update=_upd_ground_values,
                                description="地面をテクスチャペイントしている間だけ、ビューポートの数を減らして軽くする")
     paint_pct: FloatProperty(name="塗るときの表示割合", default=0.35, min=0.0, max=1.0, subtype='FACTOR',
                              update=_upd_ground_values, description="ペイント中に表示する割合")
-    # own density brush (stored into each stroke, like Ground Paint)
-    brush_softness: FloatProperty(name="境界のやわらかさ", default=0.5, min=0.0, max=1.0, subtype='FACTOR',
-                                  update=_upd_brush_colors,
-                                  description="これから塗るストロークの境界。小さいほどくっきり、大きいほど密度がなだらかに変わる")
+    # foliage brush
+    brush_radius: FloatProperty(name="サイズ (m)", default=1.0, min=0.01, soft_max=30.0, max=500.0, subtype='DISTANCE',
+                                description="ブラシの半径（[ ] キーでも変えられる）")
+    brush_strength: FloatProperty(name="強さ", default=1.0, min=0.0, max=1.0, subtype='FACTOR',
+                                  description="生やす濃さ（1で最大の密度、小さいほどまばら）。消すときは消す強さ（Shift+[ ] でも変えられる）")
+    brush_softness: FloatProperty(name="やわらかさ", default=0.5, min=0.0, max=1.0, subtype='FACTOR',
+                                  description="ブラシのふちのぼかし。0でくっきり、1で中心から外へなだらかに薄くなる（内側の円が目安）")
     brush_noise: FloatProperty(name="境界のノイズ", default=0.5, min=0.0, max=1.0, subtype='FACTOR',
-                               update=_upd_brush_colors, description="これから塗るストロークの境界をノイズで崩す強さ")
+                               update=_upd_ground_values, description="生やした所のふちをノイズで崩して自然にする強さ")
     brush_noise_scale: FloatProperty(name="ノイズの細かさ", default=1.0, min=0.01, soft_max=20.0,
                                      update=_upd_ground_values, description="1mあたりのノイズの細かさ")
+    show_overlay: BoolProperty(name="塗った所を色で表示", default=False, update=_upd_ground_values,
+                               description="ブラシで生やした所（緑）と消した所（赤）を、ビューポートだけ半透明で地面に重ねる（ブラシ中は自動で表示）")
 
 
 # ====================================================================================
@@ -1611,82 +1862,450 @@ class CSC_OT_rebuild(bpy.types.Operator):
         return {'FINISHED'}
 
 
-def _brush_layer(context):
-    g, l = _active_layer(context)
-    if l is None or not l.use_brush:
-        return None, None
-    return g, l
+def enable_brush(ground, layer, scene=None, uvname=None):
+    """Makes sure the layer has a brush image and uses it (rebuilds the layer when that changes anything)."""
+    uvname = uvname or ensure_brush_uv(ground)
+    img = ensure_brush_image(ground, layer)
+    if not layer.use_brush or layer.brush_uv != uvname:
+        _BUSY[0] += 1
+        try:
+            layer.brush_uv = uvname
+            layer.use_brush = True
+        finally:
+            _BUSY[0] -= 1
+        rebuild_layer(ground, layer, scene)
+    return img
 
 
-class CSC_OT_brush_paint(bpy.types.Operator):
-    bl_idname = "csc.brush_paint"
-    bl_label = "密度を塗る"
-    bl_description = "テクスチャペイントモードに入り、このレイヤーの密度を塗れる状態にする（塗った所に生える。X で消す）"
-    bl_options = {'REGISTER', 'UNDO'}
+def _layer_by_uid(ground, uid):
+    for l in ground.csc.layers:
+        if l.uid == uid:
+            return l
+    return None
+
+
+def _tag_redraw_3d():
+    wm = bpy.context.window_manager
+    for win in wm.windows:
+        for a in win.screen.areas:
+            if a.type == 'VIEW_3D':
+                a.tag_redraw()
+
+
+def _push_ground(ground):
+    _BUSY[0] += 1
+    try:
+        for l in ground.csc.layers:
+            push_layer(ground, l)
+    finally:
+        _BUSY[0] -= 1
+
+
+FP_FLUSH = 0.06        # seconds between writes of the brush image while painting
+FP_STATUS = ("ブラシで生やす   左ドラッグ: 生やす   Shift/Ctrl+ドラッグ: 消す   [ ]: サイズ   Shift+[ ]: 強さ   "
+             "Ctrl+ホイール: サイズ   Ctrl+Z: 1回戻す   右クリック / Esc / Enter: 終了")
+FP_UI_REGIONS = ('UI', 'HEADER', 'TOOL_HEADER', 'TOOLS', 'FOOTER', 'NAVIGATION_BAR', 'HUD', 'EXECUTE')
+
+
+def _cursor_shader():
+    """Thick lines need the polyline shader on some drivers; fall back to the plain one."""
+    try:
+        sh = gpu.shader.from_builtin('POLYLINE_UNIFORM_COLOR')
+        sh.bind()
+        sh.uniform_float("viewportSize", gpu.state.viewport_get()[2:4])
+        sh.uniform_float("lineWidth", 2.5)
+        return sh, True
+    except Exception:
+        sh = gpu.shader.from_builtin('UNIFORM_COLOR')
+        sh.bind()
+        return sh, False
+
+
+def _draw_cursor():
+    """Brush circle on the ground (green = grow, red = erase; the inner circle is where it is fully strong)."""
+    try:
+        if not _FP.get("visible") or not _FP.get("outer"):
+            return
+        shader, poly = _cursor_shader()
+        col = (1.0, 0.25, 0.2) if _FP.get("erase") else (0.25, 0.95, 0.3)
+        gpu.state.blend_set('ALPHA')
+        gpu.state.depth_test_set('NONE')
+        for key, a in (("outer", 0.95), ("inner", 0.55)):
+            pts = _FP.get(key)
+            if pts:
+                shader.uniform_float("color", (col[0], col[1], col[2], a))
+                batch_for_shader(shader, 'LINE_STRIP', {"pos": pts}).draw(shader)
+        gpu.state.blend_set('NONE')
+    except Exception as e:
+        print("CSC: cursor draw failed", e)
+
+
+class CSC_OT_foliage_paint(bpy.types.Operator):
+    bl_idname = "csc.foliage_paint"
+    bl_label = "ブラシで生やす"
+    bl_description = ("オブジェクトモードのまま地面をなでて、その場に生やす。Shift / Ctrl+ドラッグで消す。"
+                      "[ ] でサイズ、Shift+[ ] で強さ、Ctrl+Z で1ストローク戻す、右クリック / Esc / Enter で終了")
 
     @classmethod
     def poll(cls, context):
-        return _brush_layer(context)[1] is not None
+        return (_active_layer(context)[1] is not None and context.mode == 'OBJECT' and
+                context.area is not None and context.area.type == 'VIEW_3D' and not foliage_running())
 
-    def execute(self, context):
-        g, l = _brush_layer(context)
+    # ---------------------------------------------------------------- setup / teardown
+    def invoke(self, context, event):
+        g, l = _active_layer(context)
+        if not any(r.type == 'WINDOW' for r in context.area.regions):
+            return {'CANCELLED'}
         try:
-            uvname = ensure_brush_uv(g)
+            self.uv = ensure_brush_uv(g)
         except RuntimeError as e:
             self.report({'ERROR'}, str(e))
             return {'CANCELLED'}
-        img = ensure_brush_image(g, l)
-        if l.brush_uv != uvname:
-            l.brush_uv = uvname
-            rebuild_layer(g, l, context.scene)
-        me = g.data
-        if g.mode != 'TEXTURE_PAINT' and g.get("csc_prev_uv") is None and me.uv_layers.active is not None:
-            g["csc_prev_uv"] = me.uv_layers.active.name
-        me.uv_layers.active = me.uv_layers[uvname]
-        if g.mode != 'TEXTURE_PAINT':
-            bpy.ops.object.mode_set(mode='TEXTURE_PAINT')
-        ts = context.scene.tool_settings
-        ts.image_paint.mode = 'IMAGE'
-        ts.image_paint.canvas = img
-        _apply_brush_colors(ts, g.csc)
-        _BRUSH_WATCH.add(g.name)
-        if not bpy.app.timers.is_registered(_poll_brush):
-            bpy.app.timers.register(_poll_brush, first_interval=0.5)
-        return {'FINISHED'}
+        self.gname = g.name
+        mn, size = ground_uv_bounds(g)
+        self.mn, self.size = mn, size
+        sc = g.matrix_world.to_scale()
+        self.rscale = max((abs(sc.x) + abs(sc.y)) * 0.5, 1e-6)
+        self.bufs = {}
+        self.undo = []
+        self.stroke = None
+        self.last = None
+        self.cur = None
+        self.cur_uid = None
+        self.last_flush = 0.0
+        self.erase = False
+        _fp_reset()
+        _FP.update(ground=g.name, visible=False, erase=False, outer=None, inner=None, stop=False, reload=False)
+        try:
+            if self._prep(context, g, l) is None:
+                raise RuntimeError("ブラシ用の画像を準備できません")
+        except Exception as e:
+            _fp_reset()
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+        _FP["handle"] = bpy.types.SpaceView3D.draw_handler_add(_draw_cursor, (), 'WINDOW', 'POST_VIEW')
+        wm = context.window_manager
+        self.timer = wm.event_timer_add(0.02, window=context.window)
+        try:
+            context.workspace.status_text_set(FP_STATUS)
+        except Exception:
+            pass
+        _push_ground(g)
+        _tag_redraw_3d()
+        wm.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def _finish(self, context):
+        try:
+            self._flush(force=True)
+            for st in self.bufs.values():
+                img = bpy.data.images.get(st["img"])
+                if img is not None:
+                    try:
+                        img.pack()
+                    except Exception as e:
+                        print("CSC: pack failed", img.name, e)
+        except Exception:
+            traceback.print_exc()
+        try:
+            context.window_manager.event_timer_remove(self.timer)
+        except Exception:
+            pass
+        try:
+            context.workspace.status_text_set(None)
+        except Exception:
+            pass
+        _fp_reset()
+        g = bpy.data.objects.get(self.gname)
+        if g is not None:
+            _push_ground(g)
+        _tag_redraw_3d()
+
+    def cancel(self, context):
+        self._finish(context)
+
+    # ---------------------------------------------------------------- brush image buffers
+    def _prep(self, context, g, l):
+        """Gets the layer ready (brush image, UV, node tree) and returns its pixel buffer state."""
+        img = enable_brush(g, l, context.scene, self.uv)
+        st = self.bufs.get(l.uid)
+        if st is None or st["img"] != img.name or st["size"] != tuple(img.size):
+            st = {"img": img.name, "buf": read_pixels(img), "size": tuple(img.size), "dirty": False}
+            self.bufs[l.uid] = st
+        self.cur, self.cur_uid = st, l.uid
+        return st
+
+    def _flush(self, force=False):
+        now = time.monotonic()
+        if not force and now - self.last_flush < FP_FLUSH:
+            return
+        for st in self.bufs.values():
+            if st["dirty"]:
+                img = bpy.data.images.get(st["img"])
+                if img is not None and tuple(img.size) == st["size"]:
+                    write_pixels(img, st["buf"])
+                st["dirty"] = False
+                self.last_flush = now
+
+    def _reload(self):
+        _FP["reload"] = False
+        for uid, st in list(self.bufs.items()):
+            img = bpy.data.images.get(st["img"])
+            if img is None:
+                del self.bufs[uid]
+                continue
+            st["buf"], st["size"], st["dirty"] = read_pixels(img), tuple(img.size), False
+        self.undo.clear()
+        self.stroke = None
+        self.cur = self.bufs.get(self.cur_uid)
+
+    # ---------------------------------------------------------------- mouse -> ground
+    def _regions(self, area, mx, my):
+        """(3D window region, True when the mouse is over the window region and not over a side panel,
+        True when it is over the navigation gizmo corner)."""
+        win = None
+        over_other = False
+        right, top = None, None
+        for r in area.regions:
+            if r.type == 'WINDOW':
+                win = r if win is None else win
+                continue
+            if r.width <= 1 or r.height <= 1:
+                continue
+            if r.type in FP_UI_REGIONS and r.x <= mx < r.x + r.width and r.y <= my < r.y + r.height:
+                over_other = True
+        if win is None:
+            return None, False, False
+        right = win.x + win.width
+        top = win.y + win.height
+        for r in area.regions:
+            if r.width <= 1 or r.height <= 1:
+                continue
+            if r.type == 'UI' and win.x < r.x < right:
+                right = r.x
+            if r.type in ('HEADER', 'TOOL_HEADER') and win.y < r.y < top:
+                top = r.y
+        inside = win.x <= mx < win.x + win.width and win.y <= my < win.y + win.height and not over_other
+        gizmo = mx > right - 130 and my > top - 210
+        return win, inside, gizmo
+
+    def _hit(self, context, g, win, mx, my):
+        """Where the mouse points on the ground, in the ground's local space: (x, y, z) or None."""
+        rv3d = context.area.spaces.active.region_3d
+        co = (mx - win.x, my - win.y)
+        origin = view3d_utils.region_2d_to_origin_3d(win, rv3d, co)
+        direction = view3d_utils.region_2d_to_vector_3d(win, rv3d, co)
+        inv = g.matrix_world.inverted_safe()
+        o = inv @ origin
+        d = (inv.to_3x3() @ direction).normalized()
+        r = g.ray_cast(o, d, depsgraph=context.evaluated_depsgraph_get())
+        if not r[0]:
+            return None
+        return r[1].x, r[1].y, r[1].z
+
+    def _ring(self, context, g, cx, cy, cz, r, n):
+        dg = context.evaluated_depsgraph_get()
+        mw = g.matrix_world
+        top = cz + r * 2.0 + 1.0
+        reach = r * 4.0 + 3.0
+        down = mathutils.Vector((0.0, 0.0, -1.0))
+        pts = []
+        for k in range(n + 1):
+            a = math.tau * k / n
+            x, y = cx + r * math.cos(a), cy + r * math.sin(a)
+            res = g.ray_cast(mathutils.Vector((x, y, top)), down, distance=reach, depsgraph=dg)
+            z = res[1].z if res[0] else cz
+            pts.append(tuple(mw @ mathutils.Vector((x, y, z + 0.02))))
+        return pts
+
+    def _cursor(self, context, g, hit):
+        s = g.csc
+        if hit is None:
+            _FP["visible"] = False
+        else:
+            r = s.brush_radius / self.rscale
+            _FP["outer"] = self._ring(context, g, hit[0], hit[1], hit[2], r, 48)
+            inner = r * (1.0 - s.brush_softness)
+            _FP["inner"] = self._ring(context, g, hit[0], hit[1], hit[2], inner, 32) if s.brush_softness > 0.03 else None
+            _FP["visible"] = True
+        context.area.tag_redraw()
+
+    # ---------------------------------------------------------------- painting
+    def _stamp(self, g, hit):
+        """Dabs at the hit, filling in the way from the previous one."""
+        st = self.cur
+        if st is None or self.stroke is None:
+            return
+        s = g.csc
+        w, h = st["size"]
+        r = s.brush_radius / self.rscale
+        rx, ry = r / self.size[0] * w, r / self.size[1] * h
+        pos = (hit[0], hit[1])
+        if self.last is None:
+            pts = [pos]
+        else:
+            dx, dy = pos[0] - self.last[0], pos[1] - self.last[1]
+            dist = math.hypot(dx, dy)
+            n = max(1, int(math.ceil(dist / max(r * 0.2, 1e-4))))
+            pts = [(self.last[0] + dx * i / n, self.last[1] + dy * i / n) for i in range(1, n + 1)]
+        for x, y in pts:
+            cx = (x - self.mn[0]) / self.size[0] * w - 0.5
+            cy = (y - self.mn[1]) / self.size[1] * h - 0.5
+            box = dab_box(w, h, cx, cy, rx, ry)
+            if box is None:
+                continue
+            self.stroke.before(box)
+            paint_dab(st["buf"], cx, cy, rx, ry, s.brush_softness, s.brush_strength, self.erase)
+            st["dirty"] = True
+        self.last = pos
+
+    def _begin(self, context, g, hit, erase):
+        l = _active_layer(context)[1]
+        if l is None:
+            return
+        if l.uid != self.cur_uid or not l.use_brush:
+            if self._prep(context, g, l) is None:
+                return
+            _push_ground(g)
+        self.erase = erase
+        self.last = None
+        self.stroke = Stroke(self.cur["buf"])
+        self.stroke_uid = l.uid
+        if hit is not None:
+            self._stamp(g, hit)
+
+    def _end(self):
+        if self.stroke is None:
+            return
+        entry = self.stroke.result()
+        if entry is not None:
+            self.undo.append((self.stroke_uid, entry))
+            del self.undo[:-40]
+        self.stroke = None
+        self.last = None
+        self._flush(force=True)
+
+    def _undo(self):
+        if not self.undo:
+            return
+        uid, entry = self.undo.pop()
+        st = self.bufs.get(uid)
+        if st is not None:
+            restore_patch(st["buf"], entry)
+            st["dirty"] = True
+            self._flush(force=True)
+
+    # ---------------------------------------------------------------- events
+    def modal(self, context, event):
+        try:
+            return self._modal(context, event)
+        except Exception:
+            traceback.print_exc()
+            self._finish(context)
+            return {'CANCELLED'}
+
+    def _modal(self, context, event):
+        g = bpy.data.objects.get(self.gname)
+        if (g is None or not foliage_running() or _FP.get("stop") or context.area is None or
+                context.area.type != 'VIEW_3D' or context.active_object != g or context.mode != 'OBJECT'):
+            self._finish(context)
+            return {'FINISHED'}
+        if _FP.get("reload"):
+            self._reload()
+        et, val = event.type, event.value
+        if et == 'TIMER':
+            self._flush()
+            return {'PASS_THROUGH'}
+        if et == 'ESC' and val == 'PRESS':
+            self._finish(context)
+            return {'FINISHED'}
+        mx, my = event.mouse_x, event.mouse_y
+        win, inside, gizmo = self._regions(context.area, mx, my)
+        _FP["erase"] = bool(event.shift or event.ctrl)
+        if et == 'LEFTMOUSE' and val == 'RELEASE' and self.stroke is not None:
+            self._end()
+            return {'RUNNING_MODAL'}
+        if win is None or not inside:
+            if _FP.get("visible"):
+                _FP["visible"] = False
+                context.area.tag_redraw()
+            return {'PASS_THROUGH'}
+        if et in ('MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'):
+            hit = self._hit(context, g, win, mx, my)
+            self._cursor(context, g, hit)
+            if self.stroke is not None:
+                if hit is not None:
+                    self._stamp(g, hit)
+                return {'RUNNING_MODAL'}
+            return {'PASS_THROUGH'}
+        if et == 'LEFTMOUSE' and not event.alt:
+            if val in ('PRESS', 'DOUBLE_CLICK') and not gizmo:
+                self._begin(context, g, self._hit(context, g, win, mx, my), bool(event.shift or event.ctrl))
+                return {'RUNNING_MODAL'}
+            if val in ('CLICK', 'CLICK_DRAG') and self.stroke is not None:
+                return {'RUNNING_MODAL'}
+            return {'PASS_THROUGH'}
+        s = g.csc
+        if val == 'PRESS':
+            if et == 'RIGHTMOUSE' or et in ('RET', 'NUMPAD_ENTER'):
+                self._finish(context)
+                return {'FINISHED'}
+            if et == 'Z' and event.ctrl and not event.shift and not event.alt:
+                if self.stroke is None:
+                    self._undo()
+                return {'RUNNING_MODAL'}
+            if et in ('LEFT_BRACKET', 'RIGHT_BRACKET'):
+                up = et == 'RIGHT_BRACKET'
+                if event.shift:
+                    s.brush_strength = min(max(s.brush_strength + (0.05 if up else -0.05), 0.0), 1.0)
+                else:
+                    s.brush_radius = min(max(s.brush_radius * (1.12 if up else 1.0 / 1.12), 0.01), 500.0)
+                    self._cursor(context, g, self._hit(context, g, win, mx, my))
+                context.area.tag_redraw()
+                return {'RUNNING_MODAL'}
+        if et in ('WHEELUPMOUSE', 'WHEELDOWNMOUSE') and event.ctrl and not event.alt:
+            up = et == 'WHEELUPMOUSE'
+            s.brush_radius = min(max(s.brush_radius * (1.12 if up else 1.0 / 1.12), 0.01), 500.0)
+            self._cursor(context, g, self._hit(context, g, win, mx, my))
+            return {'RUNNING_MODAL'}
+        return {'PASS_THROUGH'}
 
 
-class CSC_OT_brush_exit(bpy.types.Operator):
-    bl_idname = "csc.brush_exit"
-    bl_label = "塗り終了"
-    bl_description = "オブジェクトモードに戻る"
-    bl_options = {'REGISTER', 'UNDO'}
+class CSC_OT_foliage_exit(bpy.types.Operator):
+    bl_idname = "csc.foliage_exit"
+    bl_label = "ブラシを終了"
+    bl_description = "ブラシで生やすのを終わる（右クリック / Esc / Enter でも終われる）"
 
     @classmethod
     def poll(cls, context):
-        return _ground(context) is not None
+        return foliage_running()
 
     def execute(self, context):
-        g = _ground(context)
-        if g.mode != 'OBJECT':
-            bpy.ops.object.mode_set(mode='OBJECT')
-        _end_brush(g)
+        _FP["stop"] = True
         return {'FINISHED'}
 
 
 class CSC_OT_brush_fill(bpy.types.Operator):
     bl_idname = "csc.brush_fill"
-    bl_label = "塗りつぶし"
-    bl_description = "このレイヤーの密度ブラシを全面塗る / クリアする"
+    bl_label = "全面に生やす / クリア"
+    bl_description = "このレイヤーのブラシの内容を、地面全体に生やす / すべて消して元に戻す"
     bl_options = {'REGISTER', 'UNDO'}
     value: FloatProperty(default=1.0, min=0.0, max=1.0)
 
     @classmethod
     def poll(cls, context):
-        return _brush_layer(context)[1] is not None
+        return _active_layer(context)[1] is not None
 
     def execute(self, context):
-        g, l = _brush_layer(context)
-        fill_image(ensure_brush_image(g, l), self.value, g.csc)
+        g, l = _active_layer(context)
+        try:
+            img = enable_brush(g, l, context.scene)
+        except RuntimeError as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+        fill_image(img, self.value)
+        if foliage_running():
+            _FP["reload"] = True
         return {'FINISHED'}
 
 
@@ -1855,6 +2474,48 @@ class CSC_PT_assets(_CSC_Sub, bpy.types.Panel):
         tip.label(text="散らした物は消えません", icon='BLANK1')
 
 
+class CSC_PT_brush(_CSC_Sub, bpy.types.Panel):
+    bl_idname = "CSC_PT_brush"
+    bl_label = "ブラシで生やす"
+
+    def draw(self, context):
+        layout = self.layout
+        g, l = _active_layer(context)
+        s = g.csc
+        r = layout.row()
+        r.scale_y = 1.5
+        if foliage_running():
+            r.operator("csc.foliage_exit", text="ブラシを終了", icon='CHECKMARK')
+        else:
+            r.operator("csc.foliage_paint", text="ブラシで生やす", icon='BRUSH_DATA')
+            if context.mode != 'OBJECT':
+                layout.label(text="オブジェクトモードで使えます", icon='INFO')
+        hint = layout.column(align=True)
+        hint.scale_y = 0.8
+        hint.label(text="左ドラッグ: 生やす / Shift・Ctrl+ドラッグ: 消す")
+        hint.label(text="[ ] サイズ / Shift+[ ] 強さ / Ctrl+Z 戻す")
+        hint.label(text="右クリック・Esc・Enter で終了")
+        col = layout.column(align=True)
+        col.prop(s, "brush_radius")
+        col.prop(s, "brush_strength")
+        col.prop(s, "brush_softness")
+        col = layout.column(align=True)
+        col.prop(s, "brush_noise")
+        col.prop(s, "brush_noise_scale")
+        layout.prop(s, "show_overlay", icon='RESTRICT_VIEW_OFF')
+        box = layout.box()
+        box.prop(l, "use_brush")
+        if l.use_brush:
+            box.prop(l, "brush_res")
+            row = box.row(align=True)
+            row.operator("csc.brush_fill", text="全面に生やす", icon='SNAP_FACE').value = 1.0
+            row.operator("csc.brush_fill", text="クリア", icon='X').value = 0.0
+            tip = box.column(align=True)
+            tip.scale_y = 0.75
+            tip.label(text="範囲 = (地面ペイント or ブラシで生やした所)")
+            tip.label(text="から、ブラシで消した所を除いたもの")
+
+
 class CSC_PT_place(_CSC_Sub, bpy.types.Panel):
     bl_idname = "CSC_PT_place"
     bl_label = "配置"
@@ -1904,34 +2565,6 @@ class CSC_PT_mask(_CSC_Sub, bpy.types.Panel):
                 box.prop(l, "paint_invert")
         else:
             box.label(text="地面ペイントを使うと、塗った所に散らせます", icon='INFO')
-        # own density brush
-        box = layout.box()
-        box.prop(l, "use_brush", icon='TPAINT_HLT')
-        if l.use_brush:
-            if l.cgp_uid:
-                box.row().prop(l, "brush_mode", expand=True)
-            painting = _painting_brush(context, l)
-            r = box.row()
-            r.scale_y = 1.4
-            if painting:
-                r.operator("csc.brush_exit", text="塗り終了", icon='CHECKMARK')
-            else:
-                r.operator("csc.brush_paint", text="密度を塗る", icon='BRUSH_DATA')
-            bb = box.box()
-            bb.label(text="ブラシ（これから塗るストロークに反映）", icon='BRUSH_DATA')
-            c = bb.column(align=True)
-            c.prop(g.csc, "brush_softness")
-            c.prop(g.csc, "brush_noise")
-            c.prop(g.csc, "brush_noise_scale")
-            r = box.row(align=True)
-            r.operator("csc.brush_fill", text="全面塗る", icon='SNAP_FACE').value = 1.0
-            r.operator("csc.brush_fill", text="クリア", icon='X').value = 0.0
-            box.prop(l, "brush_res")
-            if painting:
-                hint = box.column(align=True)
-                hint.scale_y = 0.8
-                hint.label(text="塗った所に生えます（色は見えません）")
-                hint.label(text="F: ブラシサイズ / X: 塗る ⇔ 消す")
         for flag, props in (("use_slope", ("slope_min", "slope_max", "slope_soft")),
                             ("use_height", ("height_min", "height_max", "height_soft")),
                             ("use_noise", ("noise_size", "noise_keep"))):
@@ -2037,9 +2670,9 @@ _HANDLERS = ((bpy.app.handlers.depsgraph_update_post, _csc_depsgraph_post),
              (bpy.app.handlers.save_pre, _csc_save_pre))
 
 classes = (CSC_Asset, CSC_Layer, CSC_Ground, CSC_OT_layer_add, CSC_OT_layer_remove, CSC_OT_layer_move,
-           CSC_OT_solo, CSC_OT_assets_reload, CSC_OT_rebuild, CSC_OT_brush_paint, CSC_OT_brush_exit,
-           CSC_OT_brush_fill, CSC_OT_realize, CSC_UL_layers, CSC_PT_main, CSC_PT_assets, CSC_PT_place,
-           CSC_PT_mask, CSC_PT_perf, CSC_PT_finish)
+           CSC_OT_solo, CSC_OT_assets_reload, CSC_OT_rebuild, CSC_OT_foliage_paint, CSC_OT_foliage_exit,
+           CSC_OT_brush_fill, CSC_OT_realize, CSC_UL_layers, CSC_PT_main, CSC_PT_assets, CSC_PT_brush,
+           CSC_PT_place, CSC_PT_mask, CSC_PT_perf, CSC_PT_finish)
 
 
 def register():
@@ -2065,7 +2698,8 @@ def _deferred_init():
 
 
 def unregister():
-    for fn in (_run_pending, _deferred_init, _poll_brush):
+    _fp_reset()
+    for fn in (_run_pending, _deferred_init):
         if bpy.app.timers.is_registered(fn):
             bpy.app.timers.unregister(fn)
     for lst, fn in _HANDLERS:
